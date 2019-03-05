@@ -61,8 +61,8 @@ namespace SimpleRequestResponseSaga
         {
             var address = new Uri($"loopback://localhost/req_resp_saga");
 
-            var requestClient = new MessageRequestClient<MyRequest, MyResponse>(bus, address, TimeSpan.FromSeconds(30));
-            var response = requestClient.Request(new MyRequest() { CorrelationId = Guid.NewGuid(), RequestMessage = "Please do this" })
+            var requestClient = new MessageRequestClient<IStartSaga, MyResponse>(bus, address, TimeSpan.FromSeconds(30));
+            var response = requestClient.Request(new { CorrelationId = Guid.NewGuid(), Data = "Please do this" })
                 .GetAwaiter()
                 .GetResult();
 
@@ -72,7 +72,9 @@ namespace SimpleRequestResponseSaga
 
     public class MySagaState : SagaStateMachineInstance
     {
-        public Guid? NullableCorrelationId { get; set; }
+        public Guid? RequestId { get; set; }
+
+        public Uri ResponseAddress { get; set; }
 
         public Guid CorrelationId { get; set; }
 
@@ -81,58 +83,79 @@ namespace SimpleRequestResponseSaga
         public string Data { get; set; }
     }
 
-    public interface IStartSagaCommand
+    public interface IStartSaga
     {
+        Guid CorrelationId { get; }
         string Data { get; }
+    }
+
+    public interface IResponseReady
+    {
+        Guid CorrelationId { get; }
+        string Data { get; }
+        Guid? RequestId { get; }
     }
 
     public class MySaga : MassTransitStateMachine<MySagaState>
     {
         public static Uri address = new Uri($"loopback://localhost/req_resp_saga");
 
-        public State Pending { get; private set; }
-        public State Done { get; private set; }
+        public Event<IStartSaga> StartSaga { get; private set; }
 
-        public Event<MyRequest> SomeRequest { get; private set; }
+        public Event<IResponseReady> ResponseReady { get; private set; }
+
+        public Request<MySagaState, MyRequest, MyResponse> SomeRequest { get; private set; }
 
         public MySaga()
         {
             InstanceState(s => s.CurrentState);
 
-            Event(() => SomeRequest,
+            Event(() => StartSaga,
                 cc =>
-                    cc.CorrelateBy(state => state.Data, context => context.Message.RequestMessage)
+                    cc.CorrelateBy(state => state.Data, context => context.Message.Data)
                         .SelectId(context => Guid.NewGuid()));
 
+            Event(() => ResponseReady, cc => cc.CorrelateById(context => context.Message.CorrelationId));
+
+            Request(() => SomeRequest, x => x.RequestId, cfg =>
+            {
+                cfg.ServiceAddress = address;
+                cfg.SchedulingServiceAddress = address;
+                cfg.Timeout = TimeSpan.FromSeconds(30);
+            });
+
             Initially(
-                When(SomeRequest)
+                When(StartSaga)
                     .Then(context =>
                     {
-                        context.Instance.Data = context.Data.RequestMessage;
+                        context.Instance.Data = context.Data.Data;
+
+                        SagaConsumeContext<MySagaState, IStartSaga> payload;
+                        if (context.TryGetPayload(out payload))
+                        {
+                            context.Instance.ResponseAddress = payload.ResponseAddress;
+                            context.Instance.RequestId = payload.RequestId;
+                        }
                     })
-                    .ThenAsync(
-                        context => Console.Out.WriteLineAsync($"Saga started: " +
-                                                              $" {context.Data.RequestMessage} received"))
-                    //.Request(SomeRequest, context => new MyRequest() { CorrelationId = context.Instance.CorrelationId, RequestMessage = "Please do this" })
-                    .TransitionTo(Pending)
-                    .Respond(context => new MyResponse() { CorrelationId = context.Instance.CorrelationId, ResponseMessage = "You got it!"})
-                    .TransitionTo(Done)
-                    .ThenAsync(context => Console.Out.WriteLineAsync($"Transition completed: " +
-                                                                     $" {(context.Instance.CurrentState == Pending ? "pending" : "done")} received"))
-                    //.Then(context =>
-                    //{
-                    //    var endpoint = context.GetSendEndpoint(address).GetAwaiter().GetResult();
-                    //    endpoint.Send(new MyResponse() { CorrelationId = context.Instance.CorrelationId, ResponseMessage = "Your wish is my command" });
-                    //})
+                    .ThenAsync(context => Console.Out.WriteLineAsync($"Saga started: \"{context.Data.Data}\" received"))
+                    .TransitionTo(SomeRequest.Pending)
+                    .Send(address, context => new MyRequest() { CorrelationId = context.Instance.CorrelationId, RequestMessage = context.Data.Data })
             );
 
-            //During(SomeRequest.Pending,
-            //    When(SomeRequest.Completed)
-            //        .ThenAsync(
-            //            context => Console.Out.WriteLineAsync($"Saga ended: " +
-            //                                                  $" {context.Data.ResponseMessage} received"))
-            //        .Finalize()
-            //);
+            During(SomeRequest.Pending,
+                When(ResponseReady)
+                    .ThenAsync(context => Console.Out.WriteLineAsync($"Saga replied: \"{context.Data.Data}\""))
+                    .ThenAsync(async context =>
+                    {
+                        var endpoint = await context.GetSendEndpoint(context.Instance.ResponseAddress);
+                        await endpoint.Send(new MyResponse() { CorrelationId = context.Instance.CorrelationId, ResponseMessage = context.Data.Data }, c => c.RequestId = context.Instance.RequestId );
+                    })
+            );
+
+            During(SomeRequest.Pending,
+                When(SomeRequest.Completed)
+                    .ThenAsync(context => Console.Out.WriteLineAsync($"Saga ended"))
+                    .Finalize());
         }
     }
 
@@ -157,9 +180,17 @@ namespace SimpleRequestResponseSaga
             // Some long running task
             await Task.Delay(3000);
 
-            //await context.RespondAsync(new MyResponse()
-            //{ CorrelationId = context.Message.CorrelationId, ResponseMessage = "Your wish is my command" });
+            await context.RespondAsync<IResponseReady>(new
+                { CorrelationId = context.Message.CorrelationId, Data = "Your wish is my command" });
         }
     }
+
+    //public class MyResponseConsumer : IConsumer<MyResponse>
+    //{
+    //    public async Task Consume(ConsumeContext<MyResponse> context)
+    //    {
+    //        await Console.Out.WriteLineAsync($"Response: {context.Message.ResponseMessage}");
+    //    }
+    //}
 }
 
